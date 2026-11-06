@@ -684,39 +684,59 @@ A side window kept for showing another buffer is no pane any more."
              (list nil (window-buffer window)))
        (window-parameter window 'tool-islands-pane-width)))
 
+(defun tool-islands-pane--geometry (frame)
+  "Return the horizontal layout and requested widths of FRAME.
+Ignore heights: echo-area and popup height changes cannot make a rejected
+horizontal resize possible.  Window identities detect splits and deletions."
+  (list (frame-pixel-width frame) window-min-width
+        (mapcar (lambda (window)
+                  (list window (window-buffer window)
+                        (window-pixel-width window)
+                        (window-parameter window 'window-side)
+                        (buffer-local-value 'window-size-fixed (window-buffer window))
+                        (when-let* ((width (tool-islands-pane--width window)))
+                          (funcall width))))
+                (window-list frame 'no-minibuffer))))
+
 (defun tool-islands-pane-fit (frame)
   "Give FRAME's side panes their widths, and fit their rows to them.
 A resize made here, inside a size change, runs no size hooks again, so
 each pane's rows are fitted here too."
-  (let ((tool-islands-pane--fitting t)
-        ;; PIXELWISE in `window-resize' specifies the delta's units, but
-        ;; without this binding Emacs still rounds it to character cells.
-        ;; An unreachable target then retries on every size hook, even for
-        ;; echo-area changes, resetting the editor's pixel scroll offset.
-        (window-resize-pixelwise t)
-        (windows (window-list frame 'no-minibuffer))
-        (neighbors nil)
-        panes)
-    ;; Resizing a side pane can also take width from the central log.
-    ;; Record its body width before moving either divider.
-    (dolist (window windows)
-      (when (and (buffer-local-value 'tool-islands-view (window-buffer window))
-                 (not (tool-islands-pane--width window)))
-        (push (cons window (window-body-width window t)) neighbors)))
-    (dolist (window windows)
-      (when-let* ((width (tool-islands-pane--width window)))
-        (push window panes)
-        (let ((delta (- (funcall width) (window-pixel-width window))))
-          ;; Even a zero-delta resize applies a new window configuration.
-          (unless (zerop delta)
-            (ignore-errors (window-resize window delta t t t))))))
-    (dolist (entry neighbors)
-      (unless (= (cdr entry) (window-body-width (car entry) t))
-        (push (car entry) panes)))
-    (dolist (window panes)
-      (with-current-buffer (window-buffer window)
-        (funcall tool-islands-refit-function window)))
-    (set-frame-parameter frame 'tool-islands-pane-frame-width (frame-pixel-width frame))))
+  (unless (or (frame-parent frame)
+              (equal (frame-parameter frame 'tool-islands-pane-last-attempt)
+                     (tool-islands-pane--geometry frame)))
+    (let ((tool-islands-pane--fitting t)
+          ;; PIXELWISE in `window-resize' specifies the delta's units, but
+          ;; without this binding Emacs still rounds it to character cells.
+          ;; An unreachable target then retries on every size hook, even for
+          ;; echo-area changes, resetting the editor's pixel scroll offset.
+          (window-resize-pixelwise t)
+          (windows (window-list frame 'no-minibuffer))
+          (neighbors nil)
+          panes)
+      ;; Resizing a side pane can also take width from the central log.
+      ;; Record its body width before moving either divider.
+      (dolist (window windows)
+	(when (and (buffer-local-value 'tool-islands-view (window-buffer window))
+                   (not (tool-islands-pane--width window)))
+          (push (cons window (window-body-width window t)) neighbors)))
+      (dolist (window windows)
+	(when-let* ((width (tool-islands-pane--width window)))
+          (push window panes)
+          (let ((delta (- (funcall width) (window-pixel-width window))))
+            ;; Even a zero-delta resize applies a new window configuration.
+            (unless (zerop delta)
+              (ignore-errors (window-resize window delta t t t))))))
+      (dolist (entry neighbors)
+	(unless (= (cdr entry) (window-body-width (car entry) t))
+          (push (car entry) panes)))
+      (dolist (window panes)
+	(with-current-buffer (window-buffer window)
+          (funcall tool-islands-refit-function window)))
+      ;; Remember the resulting geometry, including a rejected or partial resize.
+      ;; Retry only after widths, panes, constraints or requested targets change.
+      (set-frame-parameter frame 'tool-islands-pane-last-attempt
+                           (tool-islands-pane--geometry frame)))))
 
 (defun tool-islands-pane--dragged-p ()
   "Return non-nil when a mouse drag is resizing windows, or has just ended.
@@ -733,7 +753,7 @@ the redisplay that runs the size hooks for the last motion."
 A pane its divider was dragged for keeps its new share of the frame;
 after any other change, such as the frame's width or another window
 showing, each pane takes its own width again."
-  (unless tool-islands-pane--fitting
+  (unless (or tool-islands-pane--fitting (frame-parent frame))
     (let ((panes (seq-filter #'tool-islands-pane--width
                              (window-list frame 'no-minibuffer))))
       (if (tool-islands-pane--dragged-p)
@@ -741,10 +761,12 @@ showing, each pane takes its own width again."
             (let ((share (/ (float (window-pixel-width window)) (frame-pixel-width frame))))
               (set-window-parameter window 'tool-islands-pane-width
                                     (lambda () (round (* share (frame-pixel-width frame)))))))
-        (when (seq-some (lambda (window)
-                          (/= (window-pixel-width window)
-                              (funcall (tool-islands-pane--width window))))
-                        panes)
+        (when (and (not (equal (frame-parameter frame 'tool-islands-pane-last-attempt)
+                               (tool-islands-pane--geometry frame)))
+                   (seq-some (lambda (window)
+                               (/= (window-pixel-width window)
+				   (funcall (tool-islands-pane--width window))))
+                             panes))
           (tool-islands-pane-fit frame))))))
 
 (add-hook 'window-size-change-functions #'tool-islands-pane-follow)
